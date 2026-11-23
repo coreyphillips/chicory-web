@@ -1,7 +1,7 @@
 import type { Network } from '@beignet/wallet-core';
 import { bytesToHex } from '@noble/hashes/utils';
 import type { Path, Session, SessionStorage } from '@synonymdev/pubky';
-import { z } from 'zod';
+import { z } from '@/config/schema';
 import { APP_PRIVATE_PATH } from '@/config/app-files';
 import { HomeserverService } from '@/services/homeserver/homeserver';
 

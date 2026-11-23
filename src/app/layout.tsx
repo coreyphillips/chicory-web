@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from 'next';
+import { connection } from 'next/server';
 import type { ReactNode } from 'react';
 import './globals.css';
 
@@ -9,6 +10,8 @@ export const metadata: Metadata = {
 };
 export const viewport: Viewport = { themeColor: '#110e0c', colorScheme: 'dark' };
 
-export default function RootLayout({ children }: { children: ReactNode }) {
+export default async function RootLayout({ children }: { children: ReactNode }) {
+  // Every wallet document must render with the nonce issued for this request.
+  await connection();
   return <html lang="en"><body>{children}</body></html>;
 }

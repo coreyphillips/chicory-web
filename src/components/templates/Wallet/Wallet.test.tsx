@@ -2600,7 +2600,9 @@ describe('Chicory wallet', () => {
       expect(screen.queryByText(/Check the previous payment/)).toBeNull();
       await unlock();
       expect(await screen.findByText(/Check the previous payment/)).toBeVisible();
-      fireEvent.click(screen.getByRole('button', { name: 'I checked Activity' }));
+      const acknowledge = await screen.findByRole('button', { name: 'I checked Activity' });
+      await waitFor(() => expect(acknowledge).toBeEnabled());
+      fireEvent.click(acknowledge);
       await waitFor(() => expect(screen.queryByText(/Check the previous payment/)).toBeNull());
       expect(wallet.acknowledgePayment).toHaveBeenCalledOnce();
       if (rows.length) expect(screen.getByText('Outgoing payment')).toBeVisible();

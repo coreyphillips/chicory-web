@@ -5,7 +5,6 @@ import { bridgeIroh } from './iroh.mjs';
 import { validGrant } from './transport.mjs';
 
 export const maxRelayPayload = 1024 * 1024;
-export const maxRelayClients = 256;
 
 export function relayToken(settings, origin, protocolHeader) {
   const protocols = (protocolHeader ?? '').split(',').map((part) => part.trim());
