@@ -1,6 +1,6 @@
 import type { Network } from '@beignet/wallet-core';
 import type { Path, SessionStorage, StorageLock } from '@synonymdev/pubky';
-import { z } from 'zod';
+import { z } from '@/config/schema';
 import { APP_PRIVATE_PATH } from '@/config/app-files';
 import { hasCapabilities } from '@/libs/auth/capabilities';
 import { HomeserverService } from '@/services/homeserver/homeserver';

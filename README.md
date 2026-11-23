@@ -75,9 +75,13 @@ Serve the app from a stable HTTPS origin. Build with `npm ci && npm run build`, 
 | `WALLET_RELAY_SECRET` | A private 32-byte hex key shared by the self-hosted app server and relay |
 | `WALLET_RELAY_PORT` | Optional loopback relay port, default `8790` |
 | `WALLET_PEER_TUNNEL` | Optional fixed TCP forward to the configured peer |
-| `NEXT_PUBLIC_PUBKY_HTTP_RELAY` | Optional Ring approval relay, configured at build time. Defaults to the Pubky staging HTTP relay used by the original wallet. |
+| `WALLET_TRUST_PROXY` | Set to `1` when the only ingress is a trusted proxy that overwrites the client IP header. |
+| `WALLET_PUBKY_CONNECT_ORIGINS` | Additional approved Pubky homeserver origins for this deployment. See the [browser security policy](docs/browser-security.md). |
+| `NEXT_PUBLIC_PUBKY_HTTP_RELAY` | Optional Ring approval relay, configured at build time. Defaults to the production Pubky HTTP relay at `https://httprelay.pubky.app/inbox`. |
 
-On Vercel, set the app and relay origins to the same deployment domain with HTTPS and WSS respectively. The included Node routes handle upgrades and use the regional Runtime Cache for short-lived tickets. Self-hosted installations use the shared secret. Configure the reverse proxy to limit concurrent connections and request rates for a public relay. GitHub Pages can host static files only. This app needs a server for connection grants and a WebSocket relay for payments.
+On Vercel, set the app and relay origins to the same deployment domain with HTTPS and WSS respectively. The included Node routes handle upgrades and use the regional Runtime Cache for short-lived tickets. Self-hosted installations use the shared secret. Use the [relay deployment guide](docs/relay.md) for trusted client addresses, grant limits and WebSocket limits. GitHub Pages can host static files only. This app needs a server for connection grants and a WebSocket relay for payments.
+
+Build and verify a [signed release artifact](docs/releases.md) before installing it on a host. The [regtest qualification guide](docs/hosting-qualification.md) covers password and Ring unlocks, transfers and loss of device ownership on a deployed build.
 
 ## Verify
 

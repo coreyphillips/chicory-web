@@ -1,9 +1,11 @@
 import { upgradeWebSocket } from '@vercel/functions';
-import { bridgeSocket, maxRelayClients, maxRelayPayload, relayToken } from './bridge.mjs';
+import { bridgeSocket, maxRelayPayload, relayToken } from './bridge.mjs';
+import { clientSource, requestLimit, socketLimit, upgradesPerMinute } from './limits.mjs';
 import { validTicket } from './tickets.mjs';
 import { connectionSettings } from './transport.mjs';
 
-let activeClients = 0;
+const limitAttempts = requestLimit(upgradesPerMinute);
+const reserve = socketLimit();
 
 export async function upgradeRelay(request, channel) {
   const headers = { 'Cache-Control': 'private, no-store' };
@@ -12,6 +14,10 @@ export async function upgradeRelay(request, channel) {
   const url = new URL(request.url);
   if (url.search) return reject(403);
   if (process.env.VERCEL !== '1') return reject(503);
+  const client = clientSource(request.headers, process.env);
+  if (!client) return reject(403);
+  const retryAfter = limitAttempts(client);
+  if (retryAfter) return new Response(null, { status: 429, headers: { ...headers, 'Retry-After': String(retryAfter) } });
   let target;
   try {
     const settings = connectionSettings(process.env);
@@ -25,13 +31,8 @@ export async function upgradeRelay(request, channel) {
   } catch {
     return reject(503);
   }
-  if (activeClients >= maxRelayClients) return reject(429);
-  activeClients++;
-  let released = false;
-  const release = () => {
-    if (!released) activeClients--;
-    released = true;
-  };
+  const release = reserve(client);
+  if (!release) return new Response(null, { status: 429, headers: { ...headers, 'Retry-After': '1' } });
   try {
     return await upgradeWebSocket(
       (ws) => {
