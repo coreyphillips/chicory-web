@@ -4,6 +4,8 @@
 
 Run Caddy, Next.js and the wallet relay on the same machine. Point the wallet hostname at Caddy. Use the [Caddyfile](../deploy/Caddyfile) and set `WALLET_HOST` in Caddy's environment to the exact hostname, such as `wallet.example.org`. Caddy terminates HTTPS, forwards WebSocket upgrades for `/peer` and `/electrum`, and preserves the public Host header. Caddy's automatic public certificate provisioning requires a reachable hostname. For a private deployment, arrange HTTPS for the private hostname and restrict access at the network edge. [Caddy HTTPS](https://caddyserver.com/docs/automatic-https) · [Caddy reverse proxy](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy)
 
+The example sets a one-year HTTP Strict Transport Security policy on the wallet hostname. Use a dedicated hostname with renewable HTTPS.
+
 Configure both Node services with the same values. Use a unique 32-byte random `WALLET_RELAY_SECRET` and the fixed upstreams described in the [hosting guide](../README.md#hosting).
 
 ```dotenv

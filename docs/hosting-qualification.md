@@ -8,7 +8,7 @@ Use a separate, stable HTTPS origin for regtest. Install the [verified release a
 2. Check the HTTPS responses for `/` and `/wallet-engine/worker.js`. Each should have its own enforced Content Security Policy. Refresh the document and confirm its script nonce changes. Run the [Chromium policy check](browser-security.md) against the deployed origin.
 3. Create a password wallet, generate a regtest receive address, and open a second tab in the same profile. Verify the second tab reports the wallet is in use. Lock the original, try an incorrect password, then unlock with the correct password. Reload and unlock again.
 4. Use fresh profiles for the Ring flow. In the source profile choose **Continue with Pubky Ring**. Scan each approval with a test phone. Check the displayed identity and requested permissions before approving. Choose **Set up with Ring**, then **Create with Ring** on regtest. Generate a receive address. Reload and approve a fresh browser-specific unlock.
-5. Sign in with the same identity in the destination profile. Verify it reports ownership by another device. On the source, use **Settings**, **Move to another device**, and **Prepare transfer**. Approve in Ring and wait for **Ready on your other device**.
+5. Sign in with the same identity in the destination profile. Verify it reports ownership by another device. On the source, open **Settings** and choose **Move to another device**. Approve in Ring and wait for **Ready on your other device**.
 6. Claim the transfer on the destination and unlock again. Check the expected wallet state and generate the next regtest address. Reload the source and verify that even an approved local unlock cannot give it access while the destination owns the wallet.
 
 Record the commit, archive SHA-256, wallet origin, approval relay, browser and Ring versions, and which checks passed. Keep grant links, QR contents, passwords, session data, key material and channel backups out of reports.
@@ -18,6 +18,21 @@ Record the commit, archive SHA-256, wallet origin, approval relay, browser and R
 The default release contacts the production Pubky approval relay at `https://httprelay.pubky.app/inbox`. Bitcoin regtest and the approval relay are independent settings. Use an explicit build-time `NEXT_PUBLIC_PUBKY_HTTP_RELAY` override when qualifying a different service. A relay change requires a new build and a new approval test.
 
 For a phone test, both devices must reach the approval relay, and the phone must be able to reach the test identity's homeserver. Publish the wallet only on the intended private network and use a hostname with HTTPS that the clients trust. A phone interprets `localhost` as the phone itself. Keep the same wallet origin throughout the test.
+
+## Repeat the browser checks
+
+Run `node scripts/qualification/password.mjs` with `QUALIFY_WALLET_ORIGIN` set to the deployed regtest HTTPS origin. It creates an unfunded wallet in a temporary browser profile, verifies second-tab exclusion and reopens the vault after reload. For a self-signed loopback certificate, set `QUALIFY_TLS_SPKI` to its public key pin.
+
+For a local integration run, start Pubky testnet 0.17.1 with disposable signups on `http://localhost:6286` and Pkarr on `http://localhost:15411`. Allow that homeserver through the wallet's `WALLET_PUBKY_CONNECT_ORIGINS`. Run a loopback HTTPS wallet as above and install the checkout dependencies and Playwright Chromium.
+
+```sh
+QUALIFY_WALLET_ORIGIN=https://localhost:43886 \
+QUALIFY_HOMESERVER='PUBLIC_HOMESERVER_KEY' \
+QUALIFY_TLS_SPKI='BASE64_CERTIFICATE_SPKI_SHA256' \
+node scripts/qualification/ring-device.mjs
+```
+
+Replace the two placeholders with values for your test deployment. Omit `QUALIFY_TLS_SPKI` for a trusted certificate. Set `QUALIFY_APPROVAL_RELAY` if you built the app with a different relay. The check signs up a temporary SDK signer and drives two isolated browser profiles. It directs the wallet's Pkarr lookups to the local testnet while sending approval traffic to the selected relay. The manual phone check above also exercises Ring's camera, permission display and mobile approval flow.
 
 ## Account and recovery access
 

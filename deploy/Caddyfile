@@ -1,5 +1,7 @@
 # Set WALLET_HOST to the canonical hostname, e.g. wallet.example.org.
 {$WALLET_HOST} {
+	header Strict-Transport-Security "max-age=31536000"
+
 	@relay path /peer /electrum
 	handle @relay {
 		reverse_proxy 127.0.0.1:8790 {
