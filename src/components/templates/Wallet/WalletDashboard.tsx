@@ -1,0 +1,1170 @@
+'use client';
+
+import { type ReactNode, useEffect, useRef, useState } from 'react';
+import type { Activity, Network, ReceiveRequest, WalletSnapshot } from '@beignet/wallet-core';
+import { QueryClient, useMutation, useQuery } from '@tanstack/react-query';
+import {
+  Activity as ActivityIcon,
+  ArrowDownLeft,
+  ArrowUpRight,
+  Eye,
+  EyeOff,
+  ScanLine,
+  Search,
+  Check,
+  ChevronRight,
+  Clock3,
+  KeyRound,
+  LockKeyhole,
+  RefreshCw,
+  Zap,
+} from 'lucide-react';
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
+import { Button } from '@/atoms/Button/Button';
+import { Bloom } from '@/components/chicory/AccessShell';
+import { WalletFrame, type WalletView } from '@/components/chicory/WalletFrame';
+import { Dialog, DialogContent, DialogTrigger } from '@/atoms/Dialog/Dialog';
+import { Spinner } from '@/atoms/Spinner/Spinner';
+import { bitcoinAmount, lightningAmount, walletMessage } from '@/libs/wallet/amount';
+import type { LastWalletBalance, PrimaryConnectionIssue, WalletSession } from '@/services/wallet/session';
+import { useReceiveTracker } from './useReceiveTracker';
+import { SavedBalance } from './WalletOpening';
+import { RecoveryWords, WalletPanel, type WalletTask } from './WalletPanel';
+import { WalletReceive, WalletSend, type SendNavigation } from './WalletPayments';
+import { ActivityReceipt, activityReceiptAmount, activityReceiptTitle, WalletBalance } from './WalletReceipt';
+import { useWalletRecovery, WalletRecoveryNotice } from './WalletRecoveryStatus';
+
+type ActivityEntry = { key: string; row: Activity };
+// The encrypted unlock preview predates this session's recovery checks.
+export type WalletBalancePreview = LastWalletBalance & { imported?: boolean };
+export type WalletActivityHistory = {
+  source: 'vault' | 'live';
+  walletId: string;
+  network: Network;
+  imported: boolean;
+  entries: ActivityEntry[];
+  away: string[];
+};
+
+// Submissions acquire an engine ID when reconciled. A payment hash alone cannot
+// identify an attempt: two failed or retried submissions can share the same invoice.
+function keepActivityOrder(rows: Activity[], previous: ActivityEntry[] = []) {
+  if (!previous.length) return rows.map((row) => ({ key: row.id, row }));
+  const currentIds = new Set(rows.map((row) => row.id));
+  const byId = new Map(previous.map((entry) => [entry.row.id, entry]));
+  const byReference = new Map<string, ActivityEntry | null>();
+  for (const entry of previous) {
+    if (currentIds.has(entry.row.id)) continue;
+    const ref = entry.row.reference;
+    if (ref) byReference.set(ref, byReference.has(ref) ? null : entry);
+  }
+  const seen = new Set<string>();
+  const repeated = new Set<string>();
+  for (const row of rows) {
+    if (byId.has(row.id)) continue;
+    if (seen.has(row.reference)) repeated.add(row.reference);
+    seen.add(row.reference);
+  }
+  const entries = rows.map((row) => {
+    let match = byId.get(row.id);
+    if (!match && !repeated.has(row.reference) && !row.id.startsWith('submission:')) {
+      const old = byReference.get(row.reference);
+      if (old?.row.id.startsWith('submission:') && old.row.status !== 'failed') match = old;
+    }
+    const key = match && (match.key === row.id || !currentIds.has(match.key)) ? match.key : row.id;
+    return { key, row };
+  });
+  // Fill retained slots in display order. New and backfilled rows take the engine's positions.
+  const byKey = new Map(entries.map((entry) => [entry.key, entry]));
+  const retained = previous.flatMap(({ key }) => byKey.get(key) ?? []);
+  const retainedKeys = new Set(retained.map(({ key }) => key));
+  let index = 0;
+  return entries.map((entry) => (retainedKeys.has(entry.key) ? retained[index++] : entry));
+}
+
+// Wallet-core exposes sanitized setup diagnostics. Network interruptions and its
+// nonspecific connection failure can clear on the engine's first automatic retry.
+function canRetryPrimary(error?: string) {
+  return (
+    !error ||
+    /timed out|unreachable|refused the connection|address could not be resolved|^Primary setup could not complete\./i.test(
+      error,
+    )
+  );
+}
+
+const connectionDetails: Record<PrimaryConnectionIssue, string> = {
+  'ownership-pending': 'This browser is waiting to verify ownership of the Lightning wallet. Keep it open.',
+  'ownership-changed': 'Lock this wallet and continue on the device where you most recently recovered it.',
+  'handshake-timeout': 'The Lightning handshake timed out. The wallet will try a fresh connection.',
+  'handshake-closed': 'The connection closed before the Lightning handshake finished. The wallet will try again.',
+  'protocol-mismatch': 'The wallet and its Lightning peer could not agree on a compatible connection.',
+  'relay-unavailable': 'This browser lost its connection to the wallet relay. The wallet will try again.',
+};
+
+const channelHoldNote = 'Some funds are held while the wallet verifies its latest state. Still in your total.';
+
+export function WalletDashboard({
+  session,
+  connection,
+  connectionNotice,
+  walletId,
+  ringBacked,
+  recovering = false,
+  onMoveWallet,
+  onEnableRingUnlock,
+  interrupted,
+  onPaymentReviewed,
+  lastBalance,
+  onVerifiedBalance,
+  history,
+  onHistory,
+  network,
+  recipient,
+  lock,
+  task,
+}: {
+  session: WalletSession;
+  connection: 'syncing' | 'ready' | 'failed';
+  connectionNotice: ReactNode;
+  walletId: string;
+  ringBacked: boolean;
+  recovering?: boolean;
+  onMoveWallet?: () => void;
+  onEnableRingUnlock?: () => void;
+  interrupted: 'legacy' | 'payment' | null;
+  onPaymentReviewed: () => void;
+  lastBalance: WalletBalancePreview | null;
+  onVerifiedBalance: (balance: WalletBalancePreview | null) => void;
+  history?: WalletActivityHistory;
+  onHistory: (history?: WalletActivityHistory) => void;
+  network: Network;
+  recipient?: string;
+  lock: () => void;
+  task: WalletTask;
+}) {
+  const ready = connection === 'ready';
+  const [view, setView] = useState<WalletView>(recipient ? 'send' : 'overview');
+  // Keep editable amounts and destinations only for the lifetime of this unlocked wallet.
+  // A quote is always obtained again when a payment screen reopens.
+  const [sendDraft, setSendDraft] = useState({ request: recipient || '', amount: '' });
+  const [receiveForm, setReceiveForm] = useState({ amount: '', description: '', offline: false });
+  const [scanOnOpen, setScanOnOpen] = useState(false);
+  const [balanceHidden, setBalanceHidden] = useState(false);
+  const [activitySearch, setActivitySearch] = useState('');
+  const [activityKind, setActivityKind] = useState('all');
+  const exitSend = useRef<SendNavigation>(null);
+  const lastAction = useRef<'send' | 'receive' | null>(null);
+  const sendButton = useRef<HTMLButtonElement>(null);
+  const receiveButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (view !== 'overview' || !lastAction.current) return;
+    const button = lastAction.current === 'send' ? sendButton : receiveButton;
+    button.current?.focus({ preventScroll: true });
+    button.current?.scrollIntoView?.({ block: 'nearest' });
+    lastAction.current = null;
+  }, [view]);
+  const [phrase, setPhrase] = useState('');
+  // Payment controls use this visit's live queries. Activity and the last verified total follow the unlock.
+  const [queries] = useState(() => new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } }));
+  const recovery = useWalletRecovery(session, queries, walletId, ready, recovering);
+  const retained =
+    history?.walletId === walletId &&
+    history.network === network &&
+    (!recovery.checked || history.imported === recovery.imported) &&
+    (history.source === 'vault' || !recovery.blocked || recovery.state === 'checking')
+      ? history
+      : undefined;
+  const canUseWallet = ready && !recovery.blocked;
+  const ringUnlockButton = onEnableRingUnlock && (
+    <Button
+      type="button"
+      variant="outline"
+      className="self-start"
+      disabled={task.busy || !ready}
+      onClick={onEnableRingUnlock}
+    >
+      Enable Ring unlock <KeyRound aria-hidden />
+    </Button>
+  );
+  const [request, setRequest] = useState<ReceiveRequest | null>(null);
+  const tracking = useReceiveTracker(session.client, queries, walletId, request);
+  const savedActivity = useQuery(
+    {
+      queryKey: ['saved-activity', walletId, recovery.imported],
+      queryFn: async (): Promise<WalletActivityHistory> => ({
+        source: 'vault',
+        walletId,
+        network,
+        imported: recovery.imported,
+        entries: keepActivityOrder(await session.savedActivity(walletId)),
+        away: [],
+      }),
+      enabled: !canUseWallet && !retained,
+      staleTime: Infinity,
+    },
+    queries,
+  );
+  const draftKey = ['offline-receive-draft', walletId];
+  const draft = useQuery(
+    {
+      queryKey: draftKey,
+      queryFn: () => session.loadOfflineReceiveDraft(),
+      enabled: canUseWallet && view === 'receive',
+      staleTime: Infinity,
+    },
+    queries,
+  );
+  const lastReturn = useRef(0);
+  useEffect(() => {
+    const onReturn = () => {
+      if (!document.hidden) lastReturn.current = Date.now();
+    };
+    if (ready) onReturn();
+    document.addEventListener('visibilitychange', onReturn);
+    return () => document.removeEventListener('visibilitychange', onReturn);
+  }, [ready]);
+  const snapshot = useQuery(
+    {
+      // A completed import must read its own balances and activity, even if the
+      // same device had already read an empty snapshot while awaiting its backup.
+      queryKey: ['wallet', walletId, recovery.imported],
+      enabled: canUseWallet,
+      queryFn: async ({ queryKey }) => {
+        const live = await session.client.snapshot();
+        const previous = queries.getQueryData<{
+          history: WalletActivityHistory;
+          settledAt: number;
+          firstReadAt: number;
+          connectedOnce: boolean;
+        }>(queryKey);
+        const previousHistory = previous?.history ?? (retained?.imported === recovery.imported ? retained : undefined);
+        const [activityChecked, away, balanceHold, primaryIssue] = await Promise.all([
+          interrupted ? session.activityIncludesChannelSends(live.activity).catch(() => false) : false,
+          live.wallet?.id === walletId && live.wallet.network === network
+            ? session
+                .awayReceipts(walletId, live.activity, live.primary.connected)
+                .catch(() => previousHistory?.away ?? [])
+            : [],
+          live.notes?.includes(channelHoldNote)
+            ? session.channelBalanceHold(walletId).catch(() => 'held' as const)
+            : null,
+          !live.primary.connected && live.primary.setup === 'failed'
+            ? session.primaryConnectionIssue(walletId).catch(() => null)
+            : null,
+        ]);
+        const newReceipt = away.some((hash) => !previousHistory?.away.includes(hash));
+        const settledAt = newReceipt ? Date.now() : previous?.settledAt ?? 0;
+        return {
+          ...live,
+          firstReadAt: previous?.firstReadAt ?? Date.now(),
+          connectedOnce: previous?.connectedOnce || live.primary.connected,
+          history: {
+            source: 'live' as const,
+            walletId,
+            network,
+            imported: recovery.imported,
+            entries: keepActivityOrder(live.activity, previousHistory?.entries),
+            away,
+          },
+          activityChecked,
+          balanceHold,
+          primaryIssue,
+          settledAt,
+        };
+      },
+      refetchInterval: ({ state: { data } }) => {
+        const now = Date.now();
+        // A connected peer may still be delivering a settlement, and the channel
+        // balance can follow the receipt. Briefly check both on return.
+        if (data && now - data.settledAt < 5_000) return 2_000;
+        if (data && now - lastReturn.current < 60_000) {
+          const waiting = data.activity.some(
+            (row) => row.kind === 'request' && row.status === 'pending' && row.receiveRequest?.offlineReceive,
+          );
+          if (waiting || (data.balance.unresolvedOfflineSlots ?? 0) > 0) return 2_000;
+        }
+        return data?.activity.some((row) => row.kind === 'sent' && row.status === 'pending') ? 4_000 : 15_000;
+      },
+    },
+    queries,
+  );
+  useEffect(() => {
+    if (!canUseWallet) return;
+    const queryKey = ['wallet', walletId, recovery.imported];
+    let active = true;
+    let queued = false;
+    const refreshPrimary = async () => {
+      if (!active || queued) return;
+      queued = true;
+      // A hint can arrive while the first snapshot is still reading the old
+      // peer state. Finish that read, then ask the engine for fresh evidence.
+      if (queries.isFetching({ queryKey })) await queries.refetchQueries({ queryKey }, { cancelRefetch: false });
+      queued = false;
+      if (active) await queries.refetchQueries({ queryKey }, { cancelRefetch: false });
+    };
+    const unsubscribe = session.onPrimaryChange(() => void refreshPrimary());
+    // Catch a missed peer event or the offline capability probe completing
+    // after connect. The local wallet record does not scan Bitcoin or reconcile history.
+    const deadline = Date.now() + 60_000;
+    let checking = false;
+    const timer = window.setInterval(async () => {
+      if (Date.now() >= deadline) window.clearInterval(timer);
+      if (!active || checking || document.hidden || queries.isFetching({ queryKey })) return;
+      const live = queries.getQueryData<WalletSnapshot>(queryKey);
+      if (!live) return;
+      const peer = live.primary;
+      const receivePeer = live.primaries?.find((entry) => entry.isReceiveTarget) ?? peer;
+      if (
+        peer.connected &&
+        peer.setup !== 'pending' &&
+        peer.setup !== 'failed' &&
+        !peer.setupError &&
+        receivePeer.offlineReceiveAvailable !== null
+      )
+        return;
+      checking = true;
+      try {
+        const records = await session.client.listWallets();
+        const record = records.find((entry) => entry.id === walletId && entry.network === network)?.lfbw;
+        const connected = record?.primaries?.[0]?.connected;
+        if (
+          record &&
+          (record.setup !== peer.setup ||
+            record.setupError !== peer.setupError ||
+            (typeof connected === 'boolean' && connected !== peer.connected) ||
+            (typeof record.offlineReceiveAvailable === 'boolean' &&
+              record.offlineReceiveAvailable !== receivePeer.offlineReceiveAvailable))
+        ) {
+          await refreshPrimary();
+        }
+      } catch {
+        // The normal snapshot cadence still covers older engines and read failures.
+      } finally {
+        checking = false;
+      }
+    }, 1500);
+    return () => {
+      active = false;
+      unsubscribe();
+      window.clearInterval(timer);
+    };
+  }, [network, queries, canUseWallet, recovery.imported, session, walletId]);
+  const data = recovery.blocked ? undefined : snapshot.data;
+  const heldChannels = recovery.heldChannels || !!data?.balanceHold;
+  const noticeState =
+    recovery.state === 'ready' || recovery.state === 'held' ? data?.balanceHold ?? recovery.state : recovery.state;
+  const importChanged =
+    lastBalance?.imported !== undefined && recovery.checked && lastBalance.imported !== recovery.imported;
+  const awaitingImportCheck = lastBalance?.imported === true && !recovery.checked && !recovery.imported;
+  const showLiveBalance =
+    !!data && !awaitingImportCheck && (data.balance.totalSats !== 0 || (recovery.checked && !heldChannels));
+  const unverifiedZero =
+    lastBalance?.totalSats === 0 &&
+    !showLiveBalance &&
+    (recovery.blocked || heldChannels || (recovering && lastBalance.imported === undefined));
+  const savedBalance = importChanged || unverifiedZero ? null : lastBalance;
+  const retainedTotal =
+    savedBalance?.imported !== undefined && canUseWallet && !heldChannels && snapshot.isFetching
+      ? savedBalance.totalSats
+      : undefined;
+  const overviewTotal = showLiveBalance ? data.balance.totalSats : retainedTotal;
+  // A returning view can paint prior receipts while recovery and the current snapshot are being read.
+  // Payment actions continue to use the live results above.
+  const activity =
+    (!recovery.checked && retained?.source === 'live' ? retained : undefined) ??
+    data?.history ??
+    retained ??
+    savedActivity.data;
+  useEffect(() => {
+    if (activity !== history) onHistory(activity);
+  }, [activity, history, onHistory]);
+  const entries = activity?.entries;
+  const search = activitySearch.trim().toLocaleLowerCase();
+  const visibleEntries =
+    view !== 'activity'
+      ? entries
+      : entries?.filter(
+          ({ row }) =>
+            (activityKind === 'all' || row.kind === activityKind) &&
+            (!search ||
+              [row.title, row.description, row.reference, row.status, activityReceiptAmount(row)].some((field) =>
+                field?.toLocaleLowerCase().includes(search),
+              )),
+        );
+  const receivePrimary = data?.primaries?.find((primary) => primary.isReceiveTarget) ?? data?.primary;
+  const away = new Set(activity?.away);
+  const verifiedTotal =
+    showLiveBalance && data.wallet?.id === walletId && data.wallet.network === network
+      ? data.balance.totalSats
+      : undefined;
+  const checkedAt = snapshot.dataUpdatedAt;
+  const discardBalance = importChanged || (unverifiedZero && recovery.checked);
+  useEffect(() => {
+    if (verifiedTotal !== undefined) {
+      onVerifiedBalance({
+        walletId,
+        network,
+        totalSats: verifiedTotal,
+        updatedAt: checkedAt,
+        imported: recovery.imported,
+      });
+    } else if (discardBalance) {
+      onVerifiedBalance(null);
+    }
+  }, [walletId, network, verifiedTotal, checkedAt, recovery.imported, discardBalance, onVerifiedBalance]);
+  const needsPaymentReview =
+    interrupted === 'payment' ||
+    (interrupted === 'legacy' &&
+      verifiedTotal !== undefined &&
+      data?.activity.some((row) => row.kind === 'sent' && (row.status === 'pending' || row.status === 'uncertain')));
+  const canAcknowledge =
+    verifiedTotal !== undefined && data?.activityChecked && snapshot.isSuccess && !snapshot.isFetching;
+  useEffect(() => {
+    if (interrupted === 'legacy' && canAcknowledge && !needsPaymentReview) {
+      void session
+        .acknowledgePayment('legacy')
+        .then(onPaymentReviewed)
+        .catch(() => {});
+    }
+  }, [interrupted, canAcknowledge, needsPaymentReview, session, onPaymentReviewed]);
+  useEffect(() => {
+    if (verifiedTotal !== undefined)
+      void session.rememberBalance(walletId, network, verifiedTotal).catch(() => undefined);
+  }, [session, walletId, network, verifiedTotal]);
+  const unavailable = data
+    ? Math.max(0, data.balance.totalSats - data.balance.availableSats - data.balance.pendingSats)
+    : 0;
+  const notes = new Set(
+    data?.notes
+      ?.filter(
+        (note) =>
+          !note.endsWith(
+            ' sats are in a transfer that has not confirmed yet. You can send now. Bitcoin address payments complete after confirmation.',
+          ) && note !== channelHoldNote,
+      )
+      .map(walletMessage),
+  );
+  // The engine includes the generic setup note even during an ordinary peer handshake.
+  notes.delete('Wallet setup is not finished. Check Settings.');
+  const primary = data?.primary;
+  // The setup result is persisted. The authenticated peer list is live.
+  const setupError = !primary?.connected && primary?.setup !== 'pending' ? primary?.setupError : undefined;
+  const setupFailed = !primary?.connected && (primary?.setup === 'failed' || !!setupError);
+  const [online, setOnline] = useState(true);
+  const triedFreshConnection = useRef(false);
+  const {
+    mutate: redial,
+    isPending: reconnecting,
+    error: reconnectError,
+  } = useMutation(
+    {
+      mutationKey: ['primary-reconnect', walletId],
+      mutationFn: () => {
+        triedFreshConnection.current = true;
+        return session.client.retrySetup();
+      },
+      retry: false,
+      onSettled: async () => {
+        await Promise.all([
+          queries.invalidateQueries({ queryKey: ['wallet-recovery', walletId] }),
+          queries.invalidateQueries({ queryKey: ['wallet', walletId] }),
+        ]);
+      },
+    },
+    queries,
+  );
+  useEffect(() => {
+    setOnline(navigator.onLine);
+    const offline = () => setOnline(false);
+    const backOnline = () => {
+      setOnline(true);
+      const current = queries.getQueryData<WalletSnapshot & { primaryIssue?: PrimaryConnectionIssue }>([
+        'wallet',
+        walletId,
+        recovery.imported,
+      ]);
+      if (!canUseWallet || document.hidden || !current || current.primary.connected) return;
+      const issue = current.primaryIssue;
+      if (issue === 'ownership-pending' || issue === 'ownership-changed') return;
+      if (!queries.isMutating({ mutationKey: ['primary-reconnect', walletId] })) redial();
+    };
+    window.addEventListener('offline', offline);
+    window.addEventListener('online', backOnline);
+    return () => {
+      window.removeEventListener('offline', offline);
+      window.removeEventListener('online', backOnline);
+    };
+  }, [queries, walletId, recovery.imported, canUseWallet, redial]);
+  const issue = data?.primaryIssue;
+  const ownershipIssue = issue === 'ownership-pending' || issue === 'ownership-changed';
+  useEffect(() => {
+    if (primary?.connected) triedFreshConnection.current = false;
+    // A failed startup can keep using a relay pass that has been evicted. Try one
+    // newly authorized dial, then leave continued backoff to the Lightning engine.
+    if (
+      !recovery.checked ||
+      !canUseWallet ||
+      !online ||
+      !setupFailed ||
+      triedFreshConnection.current ||
+      ownershipIssue ||
+      issue === 'protocol-mismatch' ||
+      !(canRetryPrimary(setupError) || issue || setupError?.includes('could not be authenticated'))
+    )
+      return;
+    const timer = window.setTimeout(() => {
+      if (
+        document.hidden ||
+        triedFreshConnection.current ||
+        queries.isMutating({ mutationKey: ['primary-reconnect', walletId] })
+      )
+        return;
+      redial();
+    }, 750);
+    return () => window.clearTimeout(timer);
+  }, [
+    recovery.checked,
+    canUseWallet,
+    online,
+    setupFailed,
+    primary?.connected,
+    issue,
+    ownershipIssue,
+    setupError,
+    redial,
+    queries,
+    walletId,
+  ]);
+  const fallbackDetail =
+    setupError && !setupError.startsWith('Primary setup could not complete.')
+      ? walletMessage(setupError)
+      : 'The wallet could not finish connecting to Lightning. It will retry automatically.';
+  const firstReadAt = data?.firstReadAt;
+  const warmingPrimary =
+    !!data &&
+    !data.connectedOnce &&
+    !ownershipIssue &&
+    issue !== 'protocol-mismatch' &&
+    (!primary?.connected || primary.setup === 'pending' || setupFailed) &&
+    (!setupFailed || canRetryPrimary(setupError));
+  const [startupWaitElapsed, setStartupWaitElapsed] = useState(false);
+  useEffect(() => {
+    if (!warmingPrimary || !firstReadAt || startupWaitElapsed) return;
+    // Give the engine's first automatic retry (5s plus its dial timeout) time
+    // to finish. Persistent failures keep their diagnostic and reconnect action.
+    const timeout = window.setTimeout(
+      () => setStartupWaitElapsed(true),
+      Math.max(0, firstReadAt + 20_000 - Date.now()),
+    );
+    return () => window.clearTimeout(timeout);
+  }, [firstReadAt, warmingPrimary, startupWaitElapsed]);
+  const slowConnection = warmingPrimary && startupWaitElapsed && !setupFailed;
+  const needsRecovery = data?.balance.pending?.erroredSats ?? 0;
+  if (needsRecovery > 0) notes.add(`${bitcoinAmount(needsRecovery)} need recovery attention before they can be spent.`);
+  const refresh = () => {
+    if (ready) void recovery.refresh();
+    if (canUseWallet) void snapshot.refetch();
+  };
+  const switchTo = (next: WalletView, scan = false) => {
+    setScanOnOpen(scan);
+    if (next === 'overview' && (view === 'send' || view === 'receive')) lastAction.current = view;
+    setPhrase('');
+    task.clearError();
+    setView(next);
+  };
+  const notices = (
+    <>
+      {connectionNotice}
+      {ready && <WalletRecoveryNotice state={noticeState} restored={recovering && recovery.imported} />}
+      {notes.size > 0 && (
+        <ul className="grid gap-1 rounded-xl bg-background p-3 text-sm text-muted-foreground">
+          {Array.from(notes, (note) => (
+            <li key={note}>{note}</li>
+          ))}
+        </ul>
+      )}
+      {snapshot.isError && !recovery.blocked && (
+        <p role="status" className="text-sm text-muted-foreground">
+          Could not refresh the wallet.{' '}
+          {showLiveBalance || savedBalance ? 'Showing the last balance.' : 'Try refreshing.'}
+        </p>
+      )}
+      {ownershipIssue ? (
+        <p role="status" className="text-sm text-muted-foreground">
+          {connectionDetails[issue]}
+        </p>
+      ) : primary && !online ? (
+        <p role="status" className="text-sm text-muted-foreground">
+          You’re offline. Lightning will reconnect when you’re back online.
+        </p>
+      ) : primary && !primary.connected && reconnecting ? (
+        <div role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Spinner size="sm" aria-hidden className="motion-reduce:animate-none" /> Reconnecting to Lightning…
+        </div>
+      ) : warmingPrimary && !startupWaitElapsed ? (
+        <div role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Spinner size="sm" aria-hidden className="motion-reduce:animate-none" /> Connecting to Lightning…
+        </div>
+      ) : primary && (setupFailed || !primary.connected || slowConnection) ? (
+        <div className="flex flex-wrap items-center gap-2 border-t border-border pt-4 text-sm text-muted-foreground">
+          <Zap className="size-4" />{' '}
+          {setupFailed
+            ? 'Lightning connection failed'
+            : slowConnection
+            ? 'Still connecting to Lightning…'
+            : 'Lightning disconnected'}
+          <Button size="sm" variant="outline" disabled={task.busy} onClick={() => redial()}>
+            Reconnect
+          </Button>
+          {(reconnectError || setupFailed) && (
+            <p className="basis-full">
+              {reconnectError
+                ? walletMessage(reconnectError.message)
+                : issue
+                ? connectionDetails[issue]
+                : fallbackDetail}
+            </p>
+          )}
+        </div>
+      ) : null}
+    </>
+  );
+  const navigation = {
+    back: () => switchTo('overview'),
+    lock,
+    busy: task.busy,
+    balance: !balanceHidden && showLiveBalance && (
+      <p className="flex flex-wrap items-baseline gap-x-1.5 text-xs text-muted-foreground">
+        {view === 'send' ? 'Available to send' : 'Total balance'}
+        <span className="font-medium text-foreground tabular-nums">
+          {view === 'send' ? (
+            bitcoinAmount(data.balance.availableSats)
+          ) : (
+            <WalletBalance amount={data.balance.totalSats} />
+          )}
+        </span>
+      </p>
+    ),
+    notices: (
+      <>
+        {notices}
+        {view === 'send' && needsPaymentReview && (
+          <Button
+            type="button"
+            disabled={task.busy}
+            variant="outline"
+            size="sm"
+            className="self-start"
+            onClick={() => switchTo('overview')}
+          >
+            Check previous payment in Activity
+          </Button>
+        )}
+      </>
+    ),
+  };
+  const sendScreen = view === 'send' && (
+    <WalletSend
+      exit={exitSend}
+      scanOnOpen={scanOnOpen}
+      ready={canUseWallet && !ownershipIssue}
+      client={session.client}
+      navigation={navigation}
+      activity={data?.activity}
+      sendPayment={(review) => session.send(review)}
+      network={network}
+      draft={sendDraft}
+      setDraft={setSendDraft}
+      task={task}
+      refresh={refresh}
+    />
+  );
+  const receiveScreen = view === 'receive' && (
+    <WalletReceive
+      form={receiveForm}
+      setForm={setReceiveForm}
+      ready={canUseWallet && !ownershipIssue}
+      client={session.client}
+      navigation={navigation}
+      task={task}
+      request={request}
+      setRequest={setRequest}
+      receipt={tracking.receipt}
+      receivedWhileAway={!!request?.paymentHash && away.has(request.paymentHash)}
+      unavailable={tracking.unavailable}
+      offlineCapacity={data?.balance.offlineReceivableSats}
+      primaryOfflineAvailable={receivePrimary?.offlineReceiveAvailable}
+      primaryConnected={receivePrimary?.connected}
+      offlineDraft={draft.data}
+      offlineDraftReady={draft.isSuccess}
+      reloadOfflineDraft={
+        draft.isError
+          ? async () => {
+              await draft.refetch({ throwOnError: true });
+            }
+          : undefined
+      }
+      discardOfflineDraft={async (id) => {
+        await session.discardOfflineReceiveDraft(id);
+        await draft.refetch({ throwOnError: true });
+      }}
+      issueOffline={async (quote) => {
+        try {
+          const issued = await session.receive(quote);
+          queries.setQueryData(draftKey, null);
+          return issued;
+        } catch (error) {
+          await draft.refetch();
+          throw error;
+        }
+      }}
+      refresh={refresh}
+      newBitcoinAddress={() => session.newBitcoinAddress(network)}
+    />
+  );
+  function navigate(next: WalletView) {
+    if (next === view || task.busy) return;
+    if (view === 'send' && exitSend.current) exitSend.current.leave(() => switchTo(next));
+    else switchTo(next);
+  }
+  const settingsBlocked = connection === 'syncing' && !ringBacked;
+  const showHero = view === 'overview';
+  return (
+    <WalletFrame
+      view={view}
+      network={network}
+      connected={!!primary?.connected && online}
+      busy={task.busy}
+      paymentBlocked={recovery.blocked}
+      backupBlocked={settingsBlocked}
+      navigate={navigate}
+    >
+      {sendScreen}
+      {receiveScreen}
+      {showHero && (
+        <section className="wallet-overview" aria-label="Wallet overview">
+          <div className="overview-head">
+            <h1>
+              <Bloom />
+              <span>
+                Overview <small className="compact-network" aria-label={`Bitcoin network: ${network}`}>{network}</small>
+              </span>
+            </h1>
+            <div className="overview-tools">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                title="Refresh wallet"
+                disabled={!ready || task.busy || snapshot.isFetching || recovery.refreshing}
+                aria-label="Refresh wallet"
+                onClick={refresh}
+              >
+                <RefreshCw />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                title={balanceHidden ? 'Show balance' : 'Hide balance'}
+                aria-label={balanceHidden ? 'Show balance' : 'Hide balance'}
+                aria-pressed={balanceHidden}
+                onClick={() => setBalanceHidden(!balanceHidden)}
+              >
+                {balanceHidden ? <EyeOff /> : <Eye />}
+              </Button>
+              <Button type="button" variant="outline" size="sm" disabled={task.busy} onClick={lock}>
+                <LockKeyhole /> Lock
+              </Button>
+            </div>
+          </div>
+          <div className="balance-stage">
+            {balanceHidden ? (
+              <>
+                <p className="balance-label">Total balance</p>
+                <p className="balance-number" aria-label="Balance hidden">
+                  ••••
+                </p>
+              </>
+            ) : (
+              <>
+                {(overviewTotal !== undefined || !savedBalance) && <p className="balance-label">Total balance</p>}
+                {overviewTotal !== undefined ? (
+                  <p className="balance-number">
+                    <WalletBalance amount={overviewTotal} />
+                  </p>
+                ) : savedBalance ? (
+                  <SavedBalance balance={savedBalance} />
+                ) : recovery.blocked || (data && heldChannels) ? (
+                  <p className="mt-1 text-muted-foreground">Balance awaiting verification</p>
+                ) : !ready ? (
+                  <div aria-label="Balance pending" className="mt-2 h-9 w-36 rounded bg-secondary" />
+                ) : snapshot.isPending || !recovery.checked ? (
+                  <Spinner size="sm" aria-label="Loading balance" />
+                ) : (
+                  <p>Balance unavailable</p>
+                )}
+                {showLiveBalance && (
+                  <div className="balance-vessel" aria-hidden="true">
+                    <span
+                      style={{
+                        width: `${
+                          data.balance.totalSats > 0
+                            ? Math.min(100, Math.max(0, (data.balance.availableSats / data.balance.totalSats) * 100))
+                            : 0
+                        }%`,
+                      }}
+                    />
+                  </div>
+                )}
+                {showLiveBalance &&
+                  (data.balance.availableSats !== data.balance.totalSats ||
+                    data.balance.pendingSats > 0 ||
+                    heldChannels) && (
+                    <dl className="mt-4 flex flex-wrap gap-x-6 gap-y-3 text-sm">
+                      <div>
+                        <dt className="text-muted-foreground">Available to send</dt>
+                        <dd className="font-semibold tabular-nums">{bitcoinAmount(data.balance.availableSats)}</dd>
+                      </div>
+                      {data.balance.pendingSats > 0 && (
+                        <div>
+                          <dt className="text-muted-foreground">Pending</dt>
+                          <dd className="font-semibold tabular-nums">{bitcoinAmount(data.balance.pendingSats)}</dd>
+                        </div>
+                      )}
+                      {unavailable > 0 && (
+                        <div>
+                          <dt className="text-muted-foreground">Unavailable in channels</dt>
+                          <dd className="font-semibold tabular-nums">{bitcoinAmount(unavailable)}</dd>
+                        </div>
+                      )}
+                    </dl>
+                  )}
+              </>
+            )}
+          </div>
+          <div className="overview-actions">
+            <button
+              ref={sendButton}
+              type="button"
+              disabled={task.busy || recovery.blocked}
+              onClick={() => switchTo('send')}
+            >
+              <span>
+                <ArrowUpRight aria-hidden />
+              </span>
+              Send
+            </button>
+            <button
+              className="action-scan"
+              type="button"
+              disabled={task.busy || recovery.blocked}
+              onClick={() => switchTo('send', true)}
+            >
+              <span>
+                <ScanLine aria-hidden />
+              </span>
+              Scan
+            </button>
+            <button
+              ref={receiveButton}
+              type="button"
+              disabled={task.busy || recovery.blocked}
+              onClick={() => switchTo('receive')}
+            >
+              <span>
+                <ArrowDownLeft aria-hidden />
+              </span>
+              Receive
+            </button>
+          </div>
+          <div className="overview-notices">{notices}</div>
+          <button
+            type="button"
+            className="backup-shortcut"
+            disabled={task.busy || settingsBlocked}
+            aria-label="Back up wallet"
+            onClick={() => switchTo('backup')}
+          >
+            <KeyRound aria-hidden size={15} /> Wallet backup
+          </button>
+        </section>
+      )}
+      {view === 'backup' && (
+        <div className="settings-stage">
+          <div className="section-head">
+            <h1>Settings</h1>
+            <Button variant="outline" size="sm" disabled={task.busy} onClick={lock}>
+              <LockKeyhole /> Lock
+            </Button>
+          </div>
+          {view === 'backup' && ringBacked && (
+            <WalletPanel title="Pubky Ring recovery" icon={KeyRound}>
+              <p className="text-sm text-muted-foreground">
+                Back up your Pubky identity in Ring. You’ll need the same identity to open your wallet on another
+                device.
+              </p>
+              {onMoveWallet && (
+                <Button
+                  variant="outline"
+                  className="self-start"
+                  disabled={
+                    !canUseWallet ||
+                    ownershipIssue ||
+                    task.busy ||
+                    !recovery.checked ||
+                    heldChannels ||
+                    !snapshot.isSuccess ||
+                    !!interrupted ||
+                    !!data?.activity.some(
+                      (row) => row.kind === 'sent' && (row.status === 'pending' || row.status === 'uncertain'),
+                    )
+                  }
+                  onClick={onMoveWallet}
+                >
+                  Move to another device <ChevronRight />
+                </Button>
+              )}
+              {ringUnlockButton}
+            </WalletPanel>
+          )}
+          {view === 'backup' && !ringBacked && (
+            <WalletPanel title="Recovery phrase" icon={KeyRound}>
+              {phrase ? (
+                <RecoveryWords phrase={phrase} />
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  Make sure your screen is private before revealing the words.
+                </p>
+              )}
+              <Button
+                variant="outline"
+                className="self-start"
+                disabled={task.busy || connection === 'syncing'}
+                onClick={() =>
+                  phrase
+                    ? switchTo('overview')
+                    : task.run(async () => setPhrase(await session.client.getRecoveryPhrase()))
+                }
+              >
+                {phrase ? 'Hide recovery phrase' : 'Reveal recovery phrase'}
+              </Button>
+              {ringUnlockButton}
+            </WalletPanel>
+          )}
+          {notices}
+        </div>
+      )}
+      {(view === 'overview' || view === 'activity') && (
+        <section className="activity-stage" aria-label="Wallet activity">
+          <WalletPanel
+            title={activity?.source === 'vault' && entries?.length ? 'Saved activity' : 'Activity'}
+            icon={Clock3}
+          >
+            {view === 'activity' && (
+              <div className="activity-controls">
+                <label className="activity-search">
+                  <Search size={17} aria-hidden />
+                  <input
+                    type="search"
+                    aria-label="Search activity"
+                    placeholder="Search activity"
+                    value={activitySearch}
+                    onChange={(event) => setActivitySearch(event.target.value)}
+                  />
+                </label>
+                <select
+                  aria-label="Activity type"
+                  value={activityKind}
+                  onChange={(event) => setActivityKind(event.target.value)}
+                >
+                  <option value="all">All activity</option>
+                  <option value="sent">Sent</option>
+                  <option value="received">Received</option>
+                  <option value="request">Requests</option>
+                  <option value="transfer">Transfers</option>
+                </select>
+                <Button variant="outline" size="sm" disabled={task.busy} onClick={lock}>
+                  <LockKeyhole /> Lock
+                </Button>
+              </div>
+            )}
+            {needsPaymentReview && (
+              <div role="status" className="grid gap-2 rounded-xl border border-border p-3 text-sm">
+                <p>
+                  Check the previous payment before sending it again. If its outcome is unclear, confirm with the
+                  recipient.
+                </p>
+                {canAcknowledge && interrupted && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="justify-self-start"
+                    disabled={task.busy}
+                    onClick={() =>
+                      task.run(async () => {
+                        await session.acknowledgePayment(interrupted);
+                        onPaymentReviewed();
+                      })
+                    }
+                  >
+                    I checked Activity
+                  </Button>
+                )}
+                {snapshot.isSuccess && !snapshot.isFetching && !data?.activityChecked && (
+                  <p>Refresh the wallet to check all payment records.</p>
+                )}
+              </div>
+            )}
+            {!entries || (activity?.source === 'vault' && entries.length === 0) ? (
+              <p className="text-sm text-muted-foreground">
+                {recovery.blocked
+                  ? 'Activity will update after recovery.'
+                  : ready
+                  ? snapshot.isPending
+                    ? 'Loading activity…'
+                    : 'Activity unavailable.'
+                  : 'Activity will update after sync.'}
+              </p>
+            ) : entries.length === 0 ? (
+              <div className="empty-activity">
+                <Clock3 size={28} aria-hidden />
+                <p>Your payments and requests will appear here.</p>
+              </div>
+            ) : !visibleEntries?.length ? (
+              <p className="text-sm text-muted-foreground">No matching activity.</p>
+            ) : (
+              <ul className="divide-y divide-border">
+                {visibleEntries.map(({ key, row }) => (
+                  <ActivityRow
+                    key={key}
+                    row={row}
+                    checkedAt={snapshot.dataUpdatedAt}
+                    showInvoice={(invoice) => {
+                      setRequest(invoice);
+                      switchTo('receive');
+                    }}
+                    receivedWhileAway={
+                      row.kind === 'received' &&
+                      row.status === 'completed' &&
+                      !!row.paymentHash &&
+                      away.has(row.paymentHash)
+                    }
+                  />
+                ))}
+              </ul>
+            )}
+          </WalletPanel>
+        </section>
+      )}
+    </WalletFrame>
+  );
+}
+
+function ActivityRow({
+  row,
+  checkedAt,
+  receivedWhileAway,
+  showInvoice,
+}: {
+  row: Activity;
+  checkedAt: number;
+  receivedWhileAway: boolean;
+  showInvoice: (invoice: ReceiveRequest) => void;
+}) {
+  const reduced = useReducedMotion();
+  const [openedAt, setOpenedAt] = useState(0);
+  const invoice = row.receiveRequest;
+  const canShowInvoice =
+    invoice?.offlineReceive &&
+    !invoice.demo &&
+    invoice.paymentHash === row.paymentHash &&
+    row.kind === 'request' &&
+    row.status === 'pending' &&
+    row.receiveStatus?.phase === 'waiting' &&
+    !row.receiveStatusUnavailable &&
+    invoice.expiresAt > Math.max(checkedAt, openedAt);
+  const completed = row.status === 'completed';
+  const title =
+    !completed && (row.title === 'Payment sent' || row.title === 'Payment received')
+      ? activityReceiptTitle(row)
+      : row.title;
+  const Icon = completed
+    ? Check
+    : row.status === 'pending'
+    ? Clock3
+    : row.kind === 'sent'
+    ? ArrowUpRight
+    : ActivityIcon;
+  return (
+    <li data-direction={row.kind} data-status={row.status}>
+      <Dialog onOpenChange={(open) => open && setOpenedAt(Date.now())}>
+        <DialogTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            className="grid h-auto w-full grid-cols-[auto_minmax(0,1fr)_auto_auto] gap-2 rounded-xl px-1 py-3 text-left whitespace-normal sm:gap-3 sm:px-2"
+          >
+            <span aria-hidden="true" className="grid size-8 place-items-center rounded-full bg-secondary">
+              <AnimatePresence initial={false}>
+                <motion.span
+                  key={completed ? 'completed' : 'open'}
+                  initial={reduced ? false : { scale: 0.85, opacity: 0.4 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  transition={{ duration: reduced ? 0 : 0.22 }}
+                  className={completed ? 'text-brand' : 'text-muted-foreground'}
+                >
+                  <Icon className="size-4" />
+                </motion.span>
+              </AnimatePresence>
+            </span>
+            <span className="grid min-w-0 gap-0.5">
+              <span className="truncate font-semibold">{title}</span>
+              <span className="text-xs font-normal text-muted-foreground">
+                {new Date(row.timestamp).toLocaleString()}
+              </span>
+              {receivedWhileAway && (
+                <span className="text-xs font-normal text-muted-foreground">Received while you were away</span>
+              )}
+              {row.feeKnown && row.kind === 'sent' && (
+                <span className="text-xs font-normal text-muted-foreground">
+                  {row.feeEstimated ? 'Estimated fee' : 'Fee'}{' '}
+                  {row.payAll ? lightningAmount(row.payAll.feeMsat) : bitcoinAmount(row.feeSats)}
+                </span>
+              )}
+            </span>
+            <span className="grid gap-0.5 text-right">
+              <span className="text-sm font-semibold tabular-nums">
+                {row.kind === 'sent' ? '−' : row.kind === 'received' ? '+' : ''}
+                {activityReceiptAmount(row)}
+              </span>
+              <span className="text-xs font-normal text-muted-foreground capitalize">{row.status}</span>
+            </span>
+            <ChevronRight aria-hidden="true" className="size-4 text-muted-foreground" />
+          </Button>
+        </DialogTrigger>
+        <DialogContent
+          hiddenTitle="Payment receipt"
+          data-sentry-block
+          className="sentry-block w-full motion-reduce:duration-0 motion-reduce:data-[state=closed]:animate-none motion-reduce:data-[state=open]:animate-none sm:max-w-md"
+        >
+          <ActivityReceipt row={row} receivedWhileAway={receivedWhileAway} />
+          {canShowInvoice && (
+            <Button
+              variant="outline"
+              onClick={() => {
+                const now = Date.now();
+                if (invoice.expiresAt > now) showInvoice(invoice);
+                else setOpenedAt(now);
+              }}
+            >
+              Show invoice
+            </Button>
+          )}
+        </DialogContent>
+      </Dialog>
+    </li>
+  );
+}
