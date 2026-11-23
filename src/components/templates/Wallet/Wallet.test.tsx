@@ -3,13 +3,18 @@ import { act, fireEvent, render as renderUi, screen, waitFor, within } from '@te
 import userEvent from '@testing-library/user-event';
 import { bech32 } from 'bech32';
 import type { ReactNode } from 'react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RingDeviceBusyError, RingEnrollmentError } from '@/services/wallet/ring-enrollment';
 import type { LastWalletBalance, WalletStartProgress } from '@/services/wallet/session';
 import { LOCAL_ACCOUNT, useAuthStore } from '@/stores/auth/auth.store';
 import { mockRingSession } from '@/test-utils/pubky';
 import { Wallet } from './Wallet';
 import { WalletTabProvider } from './WalletTab';
+
+// Load the lazy wallet screen before timing user-visible state changes on a cold test runner.
+beforeAll(async () => {
+  await import('./WalletAccount');
+});
 
 const account = 'account-one';
 const render = (ui: ReactNode) => renderUi(ui, { wrapper: WalletTabProvider });
